@@ -131,11 +131,40 @@ public partial class MainWindow : Window
 
         try
         {
-            var exePath = Process.GetCurrentProcess().MainModule?.FileName;
-            if (!string.IsNullOrEmpty(exePath))
+            System.Drawing.Icon? trayIcon = null;
+            try
             {
-                _notifyIcon.Icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                var resInfo = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/icon.ico"));
+                if (resInfo?.Stream != null)
+                {
+                    using var s = resInfo.Stream;
+                    trayIcon = new System.Drawing.Icon(s, WinForms.SystemInformation.SmallIconSize);
+                }
             }
+            catch { }
+
+            if (trayIcon == null)
+            {
+                var iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "icon.ico");
+                if (File.Exists(iconPath))
+                {
+                    using var fs = new FileStream(iconPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    trayIcon = new System.Drawing.Icon(fs, WinForms.SystemInformation.SmallIconSize);
+                }
+            }
+
+            if (trayIcon == null)
+            {
+                var exePath = Process.GetCurrentProcess().MainModule?.FileName;
+                if (!string.IsNullOrEmpty(exePath))
+                {
+                    using var assoc = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                    if (assoc != null)
+                        trayIcon = new System.Drawing.Icon(assoc, WinForms.SystemInformation.SmallIconSize);
+                }
+            }
+
+            _notifyIcon.Icon = trayIcon;
         }
         catch (Exception ex)
         {
@@ -918,8 +947,13 @@ public partial class MainWindow : Window
 
         if (_notifyIcon != null)
         {
-            _notifyIcon.Visible = false;
-            _notifyIcon.Dispose();
+            try
+            {
+                _notifyIcon.Visible = false;
+                _notifyIcon.Dispose();
+            }
+            catch { }
+            _notifyIcon = null;
         }
 
         base.OnClosed(e);

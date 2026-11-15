@@ -1,5 +1,23 @@
 # CHANGELOG - SnakeUSBIP
 
+## [1.2.0] - 2026-11-15
+
+### Added
+- **Direct Native Windows VHCI IOCTL Client & Push Events (`VhciNativeClient.cs`)**:
+  - Eliminated repeated `usbip.exe` subprocess spawning, stdout regex parsing, and per-call directory SHA-256 hashing on Windows by communicating directly with `usbip2_ude` (`GUID_DEVINTERFACE_USBIP_VHCI`) via P/Invoke `DeviceIoControl` (`GET_IMPORTED_DEVICES`, `PLUGIN_HARDWARE`, `PLUGIN_HARDWARE_ONCE`, `PLUGOUT_HARDWARE`, `STOP_ATTACH_ATTEMPTS`) with automatic multi-revision VHCI ABI compatibility and clean `usbip.exe` fallback when the kernel interface is absent.
+  - Added asynchronous overlapped `ReadFile` / `CancelIoEx` push event monitoring (`RunDeviceStateListenerAsync`) to update connected device trees immediately on plug/unplug transitions.
+- **Global Emergency Hotkey, Headless CLI & Tray Disconnect All (Issue #10)**:
+  - Added configurable global hotkey (default `Ctrl+Alt+D`), Tray `Disconnect All`, and headless single-instance CLI commands (`--disconnect-all`, `--disconnect <port>`, `--quit`).
+  - Fixed offline favorites monitor (`initiallyConnected = false`) and added background reconnect telemetry.
+
+### Fixed
+- **Windows 11 24H2/25H2 Multi-Size Tray Icon Sizing**:
+  - Updated both Client and Windows Server `NotifyIcon` loaders to resolve icons at `SystemInformation.SmallIconSize` instead of a fixed `32x32` resource size, preventing blank tray slots on Windows 11.
+- **Linux `usbip-host` Control IN `URB_SHORT_NOT_OK` Rejection**:
+  - Added `server/patches/rpi-dwc-usbip-host/04-clear-short-not-ok.patch` restricting `URB_SHORT_NOT_OK` in `masking_bogus_flags()` to Bulk and Interrupt IN endpoints so Control IN variable-length transfers (HID feature reports, FIDO/security keys) do not fail with `-EREMOTEIO`.
+- **Android String Descriptor Fallback & `bInterval == 0` Sanitizer**:
+  - Added `0x03` (`USB_DT_STRING`) synthesis in `UrbSession.extractDescriptorFallback` and `sanitizeConfigDescriptor()` clamping `bInterval == 0` -> `1` on Interrupt/Isochronous endpoints for Windows `USBHUB3.sys` compatibility.
+
 ## [1.1.1] - 2026-11-11
 
 ### Fixed

@@ -150,6 +150,7 @@ SnakeUSBIP client connects transparently to any USB/IP host server:
 
 ## Shortcuts
 
+- **Global Hotkey (`Ctrl+Alt+D`, configurable in `config.json`)** → Disconnect all attached USB/IP devices immediately (ideal for Moonlight / Sunshine / KVM switching)
 - **Double-click** on device (in `USB Hubs` or `Favorites`) → Connect
 - **Double-click** on connected device → Disconnect
 - **Enter** in IP field → List devices
@@ -176,7 +177,9 @@ When closing the application, shutting down Windows (`AutoDetachOnExit: true`), 
 - **☑️ Start minimized to tray**: Toggle in the bottom status panel (and in the tray menu) allowing the client to launch silently to the system tray without displaying a window on Windows startup, keeping your remote USB devices permanently connected.
 - When **minimizing** (or launching with `--minimized` / `-m`), the app hides to the system tray.
 - **Double-click** on the tray icon to restore the window at any time.
-- **Right-click** for quick menu: `📡 Scan network`, `☑️ Start minimized to tray`, `🔼 Show SnakeUSBIP`, `❌ Exit`.
+- **Right-click** for quick menu: `📡 Scan network`, `🔌 Disconnect all`, `☑️ Start minimized to tray`, `🔼 Show SnakeUSBIP`, `❌ Exit`.
+- **Headless CLI Commands (to running instance):** `--connect <ip> <busid>`, `--disconnect-all`, `--disconnect <port>`, and `--quit`.
+- **Real-Time Kernel Push Events:** The Windows client listens directly to `usbip2_ude` state transitions over asynchronous `ReadFile` / `DeviceIoControl` so connected device status updates immediately without polling subprocesses.
 
 ## 🔧 Status Bar & Driver Lifecycle
 

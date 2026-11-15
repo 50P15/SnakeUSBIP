@@ -44,7 +44,7 @@ public final class BonjourPublisher: NSObject, NetServiceDelegate {
 
             "proto": "usbip".data(using: .utf8)!,
 
-            "version": "1.1.1".data(using: .utf8)!,
+            "version": "1.2.0".data(using: .utf8)!,
 
             "platform": "macOS".data(using: .utf8)!
 

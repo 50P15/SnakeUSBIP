@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Version = "1.0.0",
     [string]$OutputDir = "$PSScriptRoot\..\dist"
@@ -27,6 +27,8 @@ $serverProj = "$PSScriptRoot\..\server\src\SnakeUSBIP.Server\SnakeUSBIP.Server.c
 if (Test-Path $serverProj) {
     dotnet publish $serverProj -c Release -r win-x64 --self-contained `
         /p:PublishSingleFile=true `
+        /p:IncludeNativeLibrariesForSelfExtract=true `
+        /p:EnableCompressionInSingleFile=true `
         /p:PublishReadyToRun=true `
         /p:Version=$Version /p:AssemblyVersion=$($Version).0 /p:FileVersion=$($Version).0 /p:InformationalVersion=$Version `
         /p:DebugType=none `
@@ -41,6 +43,8 @@ $clientProj = "$PSScriptRoot\..\client\src\SnakeUSBIP\SnakeUSBIP.csproj"
 if (Test-Path $clientProj) {
     dotnet publish $clientProj -c Release -r win-x64 --self-contained `
         /p:PublishSingleFile=true `
+        /p:IncludeNativeLibrariesForSelfExtract=true `
+        /p:EnableCompressionInSingleFile=true `
         /p:PublishReadyToRun=true `
         /p:Version=$Version /p:AssemblyVersion=$($Version).0 /p:FileVersion=$($Version).0 /p:InformationalVersion=$Version `
         /p:DebugType=none `

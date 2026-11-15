@@ -3,8 +3,81 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SnakeUSBIP v1.2.0 — Industrial USB/IP Transport &amp; Native VHCI Engine</title>
-  <meta name="description" content="Industrial-grade, open-source USB/IP transport suite for Windows, Linux, and Android. Native Windows VHCI IOCTL engine, WHQL drivers, TCP/3240 + Control API 3241, and zero licensing limits.">
+  <title>SnakeUSBIP v1.2.0 — Industrial USB/IP Transport &amp; Native Windows VHCI Engine</title>
+  <meta name="description" content="Industrial-grade, open-source USB/IP transport suite for Windows, Linux, macOS, and Android. Native Windows VHCI IOCTL engine, WHQL drivers, TCP/3240 + Control API 3241, and zero licensing limits.">
+  <meta name="keywords" content="SnakeUSBIP, USB/IP Windows, USB over IP, USB over network, WHQL usbip2_ude, FlexiHub alternative, VirtualHere alternative, CNC laser LightBurn USB/IP, DualSense USB/IP, Raspberry Pi usbip-host, Android USB/IP">
+  <meta name="author" content="oscarlosu-lab">
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+  <meta name="theme-color" content="#090b0e">
+  <link rel="canonical" href="https://oscarlosu-lab.github.io/SnakeUSBIP/">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="SnakeUSBIP">
+  <meta property="og:title" content="SnakeUSBIP v1.2.0 — Deterministic USB/IP Transport &amp; Native VHCI Engine">
+  <meta property="og:description" content="Open-source GPL-3.0 USB/IP suite with native Windows VHCI IOCTL engine, WHQL drivers, TCP/UDP 3241 control plane, and Linux/SBC dwc2 kernel patches.">
+  <meta property="og:url" content="https://oscarlosu-lab.github.io/SnakeUSBIP/">
+  <meta property="og:image" content="https://oscarlosu-lab.github.io/SnakeUSBIP/assets/captures/capture_01_mainwindow_dark.png">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="es_ES">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="SnakeUSBIP v1.2.0 — Industrial USB/IP Transport">
+  <meta name="twitter:description" content="Direct C#/.NET 9 Windows VHCI IOCTL engine, WHQL drivers, TCP/3241 control plane, and SBC support. 100% Free GPL-3.0.">
+  <meta name="twitter:image" content="https://oscarlosu-lab.github.io/SnakeUSBIP/assets/captures/capture_01_mainwindow_dark.png">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "name": "SnakeUSBIP",
+        "softwareVersion": "1.2.0",
+        "operatingSystem": "Windows 10, Windows 11, Linux, macOS, Android, Android TV",
+        "applicationCategory": "UtilitiesApplication",
+        "url": "https://oscarlosu-lab.github.io/SnakeUSBIP/",
+        "downloadUrl": "https://github.com/oscarlosu-lab/SnakeUSBIP/releases/download/v1.2.0/SnakeUSBIP_Setup_v1.2.0.exe",
+        "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+        "description": "Industrial-grade, open-source USB/IP transport suite with direct Windows VHCI IOCTL engine, WHQL-signed drivers, and TCP/UDP 3241 control plane.",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "featureList": [
+          "Direct Windows VHCI IOCTL transport via WHQL usbip2_ude driver",
+          "On-demand TCP/UDP 3241 control plane with automatic LAN/VPN discovery",
+          "Linux usbip-host and Raspberry Pi / Orange Pi dwc2 kernel patches",
+          "Supports CNC/laser controllers, 3D printers, DualSense HID, and isochronous audio/video",
+          "Unlimited devices under GPL-3.0 license"
+        ]
+      },
+      {
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "How does SnakeUSBIP differ from standard usbip-win?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "SnakeUSBIP communicates directly with the WHQL-signed usbip2_ude kernel device handle via Win32 DeviceIoControl in .NET 9, eliminating child-process overhead, and adds an on-demand TCP/UDP 3241 control plane."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does SnakeUSBIP support Raspberry Pi and industrial CNC/laser devices?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. SnakeUSBIP ships Linux systemd server bundles and dwc2 kernel patches for Raspberry Pi and Orange Pi, tested with composite devices, CNC/laser controllers, 3D printers, and DualSense HID polling."
+            }
+          }
+        ]
+      }
+    ]
+  }
+  </script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%224%22 fill=%22%2310141a%22 stroke=%22%23f59e0b%22 stroke-width=%222%22/><text x=%2216%22 y=%2221%22 text-anchor=%22middle%22 font-family=%22monospace%22 font-size=%2214%22 font-weight=%22bold%22 fill=%22%23f59e0b%22>USB</text></svg>">
 
   <script src="https://cdn.tailwindcss.com"></script>
@@ -101,6 +174,7 @@
   </header>
 
   <!-- HERO: INDUSTRIAL CONSOLE -->
+  <main>
   <section class="pt-28 pb-16 border-b border-chassis-700 tech-grid">
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
       <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
@@ -399,6 +473,7 @@
       </div>
     </div>
   </section>
+  </main>
 
   <!-- FOOTER -->
   <footer class="py-8 bg-chassis-950 text-xs font-mono text-slate-500">
@@ -499,6 +574,7 @@
     let currentLang = navigator.language && navigator.language.startsWith('es') ? 'es' : 'en';
     function applyLang(lang) {
       currentLang = lang;
+      document.documentElement.lang = lang;
       const dict = i18n[lang] || i18n.en;
       document.querySelectorAll('[data-i18n]').forEach(el => {
         const key = el.getAttribute('data-i18n');

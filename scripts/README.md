@@ -15,6 +15,7 @@ This directory contains provisioning scripts, control suites, and media automati
 Interactive Terminal User Interface (TUI) dashboard and CLI management tool with zero external dependencies.
 - **Interactive TUI Dashboard**: `snakeusbip-ctl` (or `snakeusbip-ctl dashboard`)
 - **Dashboard Mode**: `snakeusbip-ctl mode [server|client|both]` (asked on first launch; switch anytime with `[m]`)
+- **Client Sleep Guard (Linux client)**: `sudo snakeusbip-ctl client-guard install` (also `status`, `uninstall`). A systemd service listens for logind `PrepareForSleep`, holds a sleep delay inhibitor, detaches imported USB/IP devices before suspend (verified in vhci_hcd sysfs) and re-attaches them on resume once the server answers on TCP 3240. Avoids suspend hangs caused by drivers talking to a vhci device after the network went down. Logs: `journalctl -u snakeusbip-client-guard`
 - **System Doctor**: `snakeusbip-ctl doctor`
 - **Protocol Loopback Test**: `snakeusbip-ctl test`
 - **Service Control**: `sudo snakeusbip-ctl start|stop|restart|status`

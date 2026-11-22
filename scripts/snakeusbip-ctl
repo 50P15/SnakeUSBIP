@@ -1077,11 +1077,11 @@ def offer_sudo_relaunch(role="both"):
         time.sleep(1.5)
 
 def get_attached_ports():
-    """Return attached USB/IP client ports without printing, or None if 'usbip' is unavailable."""
-    bin_path = shutil.which("usbip")
-    if not bin_path:
-        return None
-    return parse_client_ports(run_cmd([bin_path, "port"], timeout=10))
+    """Return (ports, error) without printing. ports is None if 'usbip' is unavailable and nothing is attached."""
+    entries, err = read_client_ports()
+    if not entries and not shutil.which("usbip"):
+        return None, None
+    return entries, err
 
 def render_dashboard(role=None):
     """Interactive Control Suite Terminal Dashboard, split into Server and Client sections."""
@@ -1095,7 +1095,7 @@ def render_dashboard(role=None):
         lan_ip = get_lan_ip()
         st = get_service_status()
         devs = list_devices() if is_server else []
-        ports = get_attached_ports() if (is_client and IS_LINUX) else None
+        ports, ports_err = get_attached_ports() if (is_client and IS_LINUX) else (None, None)
         privs = f"{GREEN}root{RESET}" if is_root() else f"{YELLOW}standard user (sudo will be requested){RESET}"
 
         print(f"""
@@ -1135,12 +1135,18 @@ def render_dashboard(role=None):
             elif ports is None:
                 print(f"  {YELLOW}'usbip' binary not found: install usbip / linux-tools to use client mode.{RESET}")
             else:
+                if ports_err:
+                    print(f"  {RED}[!] Could not read attached ports reliably: {ports_err}{RESET}")
                 print(f"  {BOLD}🔌 Remote USB devices attached here ({len(ports)}):{RESET}")
-                if not ports:
+                if not ports and not ports_err:
                     print(f"    {DIM}None. Use [9] to connect one.{RESET}")
                 for e in ports:
                     remote_str = f"{e['ip']}/{e['busid']}" if e["ip"] or e["busid"] else "remote"
                     print(f"    • Port {BOLD}{e['port']}{RESET}: {remote_str} — {e['desc']}")
+                guard = run_cmd(["systemctl", "is-active", GUARD_UNIT], timeout=5) if shutil.which("systemctl") else ""
+                guard_str = (f"{GREEN}active{RESET}" if guard == "active"
+                             else f"{YELLOW}off{RESET} {DIM}(sudo snakeusbip-ctl client-guard install){RESET}")
+                print(f"  • {BOLD}Sleep guard:{RESET} {guard_str}")
             print(f"""
   {BOLD}[9]{RESET} Connect Remote USB            {BOLD}[0]{RESET} Detach Remote USB""")
 
@@ -1213,7 +1219,7 @@ def render_dashboard(role=None):
                 connect_remote_device(srv_ip, rem_bus)
                 pause()
             elif choice == "0":
-                if list_client_ports():
+                if list_client_ports() or load_client_state():
                     port_or_bus = ask("Enter Port number, Bus ID, or 'all' to detach (q to cancel): ")
                     if not port_or_bus:
                         raise PromptCancelled()
@@ -1338,6 +1344,259 @@ def list_remote_devices(server_ip, numbered=False):
         print(f"  {YELLOW}No remote USB devices found on {ip} (verify server IP and ports 3240/3241).{RESET}")
     return results
 
+VHCI_PLATFORM_GLOB = "/sys/devices/platform/vhci_hcd.*"
+VHCI_ST_USED = 6
+VHCI_ST_ERROR = 7
+CLIENT_RUN_DIR = "/run/snakeusbip"
+CLIENT_LOCK_FILE = os.path.join(CLIENT_RUN_DIR, "client.lock")
+CLIENT_STATE_FILE = os.path.join(CLIENT_RUN_DIR, "client-restore.json")
+GUARD_UNIT = "snakeusbip-client-guard.service"
+SLEEP_UNIT = "snakeusbip-client-sleep.service"
+SYSTEMD_UNIT_DIR = "/etc/systemd/system"
+GUARD_SLEEP_BUDGET = 4.0    # logind's default InhibitDelayMaxSec is 5s
+GUARD_RESTORE_WINDOW = 180.0
+GUARD_FORCE_REBIND_AFTER = 30.0
+
+def run_bounded(cmd, timeout):
+    """
+    Like run_cmd_result(), but never blocks past the timeout: a process stuck in
+    uninterruptible sleep (D state) cannot be reaped, so it is abandoned instead.
+    """
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+        return None, "", str(e)
+    try:
+        out, err = proc.communicate(timeout=max(0.1, timeout))
+        return proc.returncode, (out or "").strip(), (err or "").strip()
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=0.5)
+        except Exception:
+            pass
+        return None, "", f"timed out after {timeout:.1f}s"
+
+def read_vhci_status():
+    """
+    Read vhci_hcd port states from sysfs. Returns {port: {"status": int, "local_busid": str}},
+    or None when no vhci_hcd controller exists (module not loaded).
+    """
+    import glob
+    files = sorted(glob.glob(os.path.join(VHCI_PLATFORM_GLOB, "status*")))
+    if not files:
+        return None
+    ports = {}
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            parts = line.split()
+            if not parts or parts[0] in ("hub", "port", "prt"):
+                continue
+            if parts[0] in ("hs", "ss"):
+                parts = parts[1:]
+            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            ports[int(parts[0])] = {
+                "status": int(parts[1]),
+                "local_busid": parts[-1] if len(parts) >= 6 and parts[-1] != "0-0" else "",
+            }
+    return ports
+
+def _occupied_ports(status):
+    return {p: s for p, s in (status or {}).items() if s["status"] in (VHCI_ST_USED, VHCI_ST_ERROR)}
+
+def read_client_ports():
+    """
+    Return (entries, error) for imported USB/IP devices. A failing 'usbip port' is reported
+    as an error and never as "no devices": occupied vhci ports found in sysfs are still
+    returned (without remote ip/busid) so they can be detached.
+    """
+    status = read_vhci_status()
+    if status is None:
+        return [], None
+    occupied = _occupied_ports(status)
+    bin_path = shutil.which("usbip")
+    error = None
+    entries = []
+    if not bin_path:
+        error = "'usbip' binary not found"
+    else:
+        rc, out, err = run_bounded([bin_path, "port"], timeout=10)
+        if rc != 0:
+            error = f"'usbip port' failed: {err or out or f'exit code {rc}'}"
+        else:
+            entries = parse_client_ports(out)
+    listed = {e["port"] for e in entries}
+    missing = [p for p in sorted(occupied) if str(p) not in listed]
+    if missing and not error:
+        error = f"'usbip port' did not list occupied vhci port(s) {', '.join(map(str, missing))}"
+    for p in missing:
+        entries.append({"port": str(p), "ip": "", "busid": "", "desc": f"vhci port {p} (remote unknown)"})
+    for e in entries:
+        st = status.get(int(e["port"])) if e["port"].isdigit() else None
+        e["state"] = st["status"] if st else None
+    return entries, error
+
+class client_lock:
+    """
+    Exclusive lock shared by manual connect/disconnect, the sleep guard and the sleep hook.
+    flock() locks belong to the open file, so threads of one process also exclude each other.
+    """
+    def __init__(self, timeout=30.0):
+        self.timeout = timeout
+        self.fd = None
+        self.acquired = False
+
+    def __enter__(self):
+        import fcntl
+        try:
+            os.makedirs(CLIENT_RUN_DIR, mode=0o755, exist_ok=True)
+            self.fd = os.open(CLIENT_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            return False
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return True
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)  # also releases the lock
+            self.fd = None
+        return False
+
+def load_client_state():
+    """Devices detached for suspend that still have to be restored: [{'ip':..., 'busid':...}]."""
+    try:
+        with open(CLIENT_STATE_FILE, "r", encoding="utf-8") as f:
+            devs = json.load(f).get("devices", [])
+        return [{"ip": d["ip"], "busid": d["busid"]} for d in devs
+                if is_valid_host(d.get("ip")) and is_valid_busid(d.get("busid"))]
+    except Exception:
+        return []
+
+def save_client_state(devices):
+    uniq = []
+    for d in devices:
+        key = {"ip": d["ip"], "busid": d["busid"]}
+        if key not in uniq:
+            uniq.append(key)
+    try:
+        if not uniq:
+            if os.path.exists(CLIENT_STATE_FILE):
+                os.remove(CLIENT_STATE_FILE)
+            return True
+        os.makedirs(CLIENT_RUN_DIR, mode=0o755, exist_ok=True)
+        tmp = CLIENT_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"devices": uniq, "updated": time.time()}, f, indent=2)
+        os.replace(tmp, CLIENT_STATE_FILE)
+        return True
+    except Exception:
+        return False
+
+def _same_remote(entry, ip, busid):
+    return entry.get("ip", "").lower() == ip.lower() and entry.get("busid", "") == busid
+
+def detach_client_ports(entries, deadline):
+    """
+    Detach vhci ports and verify in sysfs that they were released.
+    Returns (released_entries, failed [(entry, reason)]). Never waits past `deadline`.
+    """
+    bin_path = shutil.which("usbip")
+    for e in entries:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.2:
+            break
+        rc, out, err = (None, "", "'usbip' binary not found")
+        if bin_path:
+            rc, out, err = run_bounded([bin_path, "detach", "-p", e["port"]], timeout=min(2.0, remaining))
+        if rc != 0 and e["port"].isdigit():
+            # Fall back to the kernel interface used by 'usbip detach'
+            remaining = deadline - time.monotonic()
+            if remaining > 0.2:
+                run_bounded(["sh", "-c", f"echo {int(e['port'])} > /sys/devices/platform/vhci_hcd.0/detach"],
+                            timeout=min(1.5, remaining))
+        e["_detach_msg"] = err or out
+    released, failed = [], []
+    while True:
+        status = read_vhci_status() or {}
+        busy = _occupied_ports(status)
+        pending = [e for e in entries if e["port"].isdigit() and int(e["port"]) in busy]
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    for e in entries:
+        if e in pending or not e["port"].isdigit():
+            failed.append((e, e.get("_detach_msg") or "port still in use"))
+        else:
+            released.append(e)
+    return released, failed
+
+def attach_remote_device(ip, busid, attach_timeout=10.0, verify_timeout=5.0):
+    """
+    Bind (TCP 3241, if supported) and attach a remote device, then verify that a vhci port
+    shows ip/busid. Caller must hold client_lock. Returns (ok, message).
+    """
+    entries, err = read_client_ports()
+    if err:
+        return False, f"cannot check attached ports: {err}"
+    for e in entries:
+        if _same_remote(e, ip, busid):
+            if e.get("state") == VHCI_ST_ERROR:
+                detach_client_ports([e], time.monotonic() + 3)
+                break
+            return True, f"already attached on port {e['port']}"
+
+    bin_path = shutil.which("usbip")
+    if not bin_path:
+        return False, "'usbip' client binary not found. Install linux-tools-generic or usbip."
+    run_bounded(["modprobe", "usbip_core"], timeout=10)
+    rc, _, merr = run_bounded(["modprobe", "vhci_hcd"], timeout=10)
+    if rc != 0:
+        return False, f"could not load vhci_hcd kernel module: {merr or f'exit code {rc}'}"
+
+    notes = []
+    bind_resp = send_control_command(ip, f"BIND {busid}", timeout=2.0)
+    if isinstance(bind_resp, dict):
+        st = (bind_resp.get("status") or "").upper()
+        if st == "DENIED":
+            return False, f"remote server denied export of {busid}: {bind_resp.get('message')}"
+        if st == "OK":
+            notes.append(f"on-demand BIND accepted by {ip}:{CONTROL_PORT}")
+            time.sleep(0.25)
+        elif bind_resp.get("message"):
+            notes.append(f"remote BIND reported: {bind_resp.get('message')}")
+
+    # usbip reports errors on stderr, so check the exit code and both streams
+    rc, out, aerr = run_bounded([bin_path, "attach", "-r", ip, "-b", busid], timeout=attach_timeout)
+    combined = f"{out}\n{aerr}".strip()
+    if rc != 0 or "error" in combined.lower() or "failed" in combined.lower():
+        return False, f"attach failed: {combined or f'exit code {rc}'}"
+
+    deadline = time.monotonic() + verify_timeout
+    while True:
+        entries, err = read_client_ports()
+        match = [e for e in entries if _same_remote(e, ip, busid) and e.get("state") == VHCI_ST_USED]
+        if match:
+            notes.append(f"verified on vhci port {match[0]['port']}")
+            return True, "; ".join(notes)
+        if time.monotonic() >= deadline:
+            detail = f" ({err})" if err else ""
+            return False, f"'usbip attach' returned success but no vhci port shows {ip}/{busid}{detail}"
+        time.sleep(0.2)
+
 def connect_remote_device(server_ip, busid):
     """Attach a remote USB/IP device into local Linux vhci_hcd client driver (with on-demand TCP 3241 BIND)."""
     if not IS_LINUX:
@@ -1353,40 +1612,16 @@ def connect_remote_device(server_ip, busid):
         print(f"{YELLOW}[!] Superuser privileges required for vhci_hcd attach. Re-running with sudo...{RESET}")
         return rerun_with_sudo("connect", ip, bid)
 
-    # 1. Load Linux USB/IP client kernel modules
-    run_cmd(["modprobe", "usbip_core"])
-    rc, _, err = run_cmd_result(["modprobe", "vhci_hcd"])
-    if rc != 0:
-        print(f"{YELLOW}[!] Could not load vhci_hcd kernel module: {err or f'exit code {rc}'}{RESET}")
-
-    # 2. Request on-demand BIND via TCP 3241 if server supports Dynamic Control
-    bind_resp = send_control_command(ip, f"BIND {bid}")
-    if isinstance(bind_resp, dict):
-        st = (bind_resp.get("status") or "").upper()
-        if st == "DENIED":
-            print(f"{RED}[Policy Denied] Remote server blocked export of {bid}: {bind_resp.get('message')}{RESET}")
+    with client_lock(timeout=30) as locked:
+        if not locked:
+            print(f"{RED}✗ Another USB/IP client operation (sleep guard or attach/detach) is still running. Try again.{RESET}")
             return False
-        elif st == "OK":
-            print(f"{GREEN}✓ On-demand BIND {bid} accepted by {ip}:{CONTROL_PORT}{RESET}")
-            time.sleep(0.25)
-        elif bind_resp.get("message"):
-            print(f"{YELLOW}[!] Remote BIND {bid} reported: {bind_resp.get('message')}{RESET}")
-
-    # 3. Attach into local vhci_hcd
-    bin_path = shutil.which("usbip")
-    if not bin_path:
-        print(f"{RED}[Error] 'usbip' client binary not found. Install linux-tools-generic or usbip.{RESET}")
-        return False
-
-    # usbip reports errors on stderr, so check the exit code and both streams
-    rc, out, err = run_cmd_result([bin_path, "attach", "-r", ip, "-b", bid])
-    combined = f"{out}\n{err}".strip()
-    if rc != 0 or "error" in combined.lower() or "failed" in combined.lower():
-        print(f"{RED}✗ Failed to attach {bid} from {ip}: {combined or f'exit code {rc}'}{RESET}")
-        return False
-
-    print(f"{GREEN}✓ Attached {bid} from {ip} into local Linux vhci_hcd!{RESET}")
-    return True
+        ok, msg = attach_remote_device(ip, bid)
+    if ok:
+        print(f"{GREEN}✓ Attached {bid} from {ip} into local Linux vhci_hcd ({msg}).{RESET}")
+    else:
+        print(f"{RED}✗ Failed to attach {bid} from {ip}: {msg}{RESET}")
+    return ok
 
 def parse_client_ports(port_output):
     """Parse 'usbip port' output into list of dicts: [{'port': '00', 'ip': '...', 'busid': '...', 'desc': '...'}]."""
@@ -1416,19 +1651,20 @@ def parse_client_ports(port_output):
 
 def list_client_ports():
     """Display currently attached remote USB devices on this Linux client."""
-    bin_path = shutil.which("usbip")
-    if not bin_path:
-        print(f"{YELLOW}'usbip' binary not found.{RESET}")
-        return []
-    out = run_cmd([bin_path, "port"])
-    entries = parse_client_ports(out)
+    entries, err = read_client_ports()
+    if err:
+        print(f"{RED}[Error] Could not read attached ports reliably: {err}{RESET}")
     print(f"\n{CYAN}═══ 🔌 Attached Remote USB Ports ({len(entries)}) ═══{RESET}")
     if not entries:
-        print(f"  {DIM}No remote USB devices currently attached.{RESET}")
+        print(f"  {DIM}{'Unknown.' if err else 'No remote USB devices currently attached.'}{RESET}")
     else:
         for e in entries:
             remote_str = f"{e['ip']}/{e['busid']}" if e["ip"] or e["busid"] else "remote"
             print(f"  • Port {BOLD}{e['port']}{RESET}: {remote_str} — {e['desc']}")
+    pending = load_client_state()
+    if pending:
+        items = ", ".join(f"{d['ip']}/{d['busid']}" for d in pending)
+        print(f"  {YELLOW}Waiting to be restored after resume: {items}{RESET}")
     return entries
 
 def disconnect_remote_device(target="all"):
@@ -1440,41 +1676,442 @@ def disconnect_remote_device(target="all"):
         print(f"{YELLOW}[!] Superuser privileges required for vhci_hcd detach. Re-running with sudo...{RESET}")
         return rerun_with_sudo("disconnect", (target or "all").strip())
 
-    bin_path = shutil.which("usbip")
-    if not bin_path:
-        print(f"{RED}[Error] 'usbip' client binary not found.{RESET}")
-        return False
+    with client_lock(timeout=30) as locked:
+        if not locked:
+            print(f"{RED}✗ Another USB/IP client operation (sleep guard or attach/detach) is still running. Try again.{RESET}")
+            return False
+        return _disconnect_locked(target)
 
-    entries = parse_client_ports(run_cmd([bin_path, "port"]))
-    if not entries:
-        print(f"{YELLOW}No attached USB/IP client ports found.{RESET}")
-        return True
-
+def _disconnect_locked(target):
     tgt = (target or "all").strip().lower()
     tgt_port = str(int(tgt)) if tgt.isdigit() else tgt
-    matched = [
-        e for e in entries
-        if tgt == "all" or e["port"] == tgt_port or e["busid"].lower() == tgt
-    ]
+
+    # A manual detach also cancels a pending restore of the same device
+    pending = load_client_state()
+    keep = [d for d in pending if not (tgt == "all" or d["busid"].lower() == tgt)]
+    dropped = [d for d in pending if d not in keep]
+
+    entries, err = read_client_ports()
+    if err:
+        print(f"{YELLOW}[!] Could not read attached ports reliably: {err}{RESET}")
+    matched = [e for e in entries if tgt == "all" or e["port"] == tgt_port or e["busid"].lower() == tgt]
     if not matched and tgt.isdigit():
-        matched = [{"port": tgt_port, "ip": "", "busid": "", "desc": ""}]
+        status = read_vhci_status() or {}
+        if int(tgt) in _occupied_ports(status):
+            matched = [{"port": tgt_port, "ip": "", "busid": "", "desc": ""}]
+    for e in matched:
+        keep = [d for d in keep if not _same_remote(e, d["ip"], d["busid"])]
+    if len(keep) != len(pending):
+        save_client_state(keep)
+        for d in pending:
+            if d not in keep:
+                print(f"{GREEN}✓ Cancelled pending restore of {d['ip']}/{d['busid']}{RESET}")
+
     if not matched:
+        if err and not entries:
+            print(f"{RED}✗ Cannot tell which ports are attached, nothing was detached.{RESET}")
+            return False
+        if dropped:
+            return True
+        if not entries:
+            print(f"{YELLOW}No attached USB/IP client ports found.{RESET}")
+            return True
         print(f"{YELLOW}No attached port or Bus ID matches '{target}'.{RESET}")
         return False
 
-    all_ok = True
-    for e in matched:
-        rc, out, err = run_cmd_result([bin_path, "detach", "-p", e["port"]])
-        if rc != 0:
-            print(f"{RED}✗ Failed to detach Port {e['port']}: {err or out or f'exit code {rc}'}{RESET}")
-            all_ok = False
-            continue
-        print(f"{GREEN}✓ Detached local vhci_hcd Port {e['port']}{RESET}")
+    released, failed = detach_client_ports(matched, time.monotonic() + 10)
+    for e, reason in failed:
+        print(f"{RED}✗ Failed to detach Port {e['port']}: {reason or 'port still in use'}{RESET}")
+    for e in released:
+        print(f"{GREEN}✓ Detached local vhci_hcd Port {e['port']} (verified released){RESET}")
         if e["ip"] and e["busid"]:
             unbind_resp = send_control_command(e["ip"], f"UNBIND {e['busid']}")
             if isinstance(unbind_resp, dict) and (unbind_resp.get("status") or "").upper() == "OK":
                 print(f"{GREEN}✓ Released {e['busid']} back to remote host {e['ip']}{RESET}")
-    return all_ok
+    return not failed
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LINUX CLIENT SLEEP GUARD (logind PrepareForSleep + delay inhibitor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def glog(level, msg):
+    """Log a line for the journal (sd-daemon priority prefix) or the terminal."""
+    prio = {"error": 3, "warning": 4, "info": 6}.get(level, 6)
+    if sys.stdout.isatty():
+        color = {"error": RED, "warning": YELLOW}.get(level, "")
+        print(f"{color}{msg}{RESET if color else ''}", flush=True)
+    else:
+        print(f"<{prio}>{msg}", flush=True)
+
+def tcp_reachable(host, port=PORT, timeout=1.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+def client_suspend_detach(deadline, log=glog):
+    """
+    Detach every imported device before sleep, record it for restore and verify the release.
+    Network-independent: the remote UNBIND is only attempted with the time left.
+    Caller must hold client_lock (or have failed to get it in time). Returns True if all released.
+    """
+    entries, err = read_client_ports()
+    if err:
+        log("warning", f"Port listing incomplete: {err}")
+    if not entries:
+        if not err:
+            log("info", "No imported USB/IP devices to detach.")
+        return not err
+    restorable = [{"ip": e["ip"], "busid": e["busid"]} for e in entries if e["ip"] and e["busid"]]
+    if not save_client_state(load_client_state() + restorable):
+        log("error", f"Could not write {CLIENT_STATE_FILE}: devices will not be restored after resume.")
+    for e in entries:
+        if not (e["ip"] and e["busid"]):
+            log("warning", f"Port {e['port']}: remote ip/busid unknown, it will be detached but not restored.")
+
+    released, failed = detach_client_ports(entries, deadline)
+    for e in released:
+        log("info", f"Detached port {e['port']} ({e['ip']}/{e['busid']}), released in sysfs.")
+    for e, reason in failed:
+        log("error", f"Port {e['port']} ({e['ip']}/{e['busid']}) NOT released before sleep: {reason}")
+    remaining = deadline - time.monotonic()
+    if released and remaining > 0.3:
+        rc, _, serr = run_bounded(["udevadm", "settle", f"--timeout={max(1, int(min(remaining - 0.2, 2)))}"],
+                                  timeout=min(remaining - 0.1, 2.5))
+        if rc != 0:
+            log("warning", f"udevadm settle: {serr or f'exit code {rc}'}")
+    for e in released:
+        remaining = deadline - time.monotonic()
+        if not (e["ip"] and e["busid"]) or remaining < 0.3:
+            continue
+        resp = send_control_command(e["ip"], f"UNBIND {e['busid']}", timeout=min(1.0, remaining - 0.1))
+        if isinstance(resp, dict) and (resp.get("status") or "").upper() == "OK":
+            log("info", f"Remote {e['ip']} released {e['busid']}.")
+    return not failed
+
+class ClientSleepGuard:
+    """Detach imported USB/IP devices on PrepareForSleep(true), restore them on PrepareForSleep(false)."""
+
+    def __init__(self, log=glog):
+        self.log = log
+        self.inhibitor = None
+        self.monitor = None
+        self.restore_thread = None
+        self.restore_cancel = threading.Event()
+        self.stopping = threading.Event()
+        self.logind_owner = None
+
+    # ── logind delay inhibitor ──
+    def take_inhibitor(self):
+        if self.inhibitor and self.inhibitor.poll() is None:
+            return True
+        try:
+            self.inhibitor = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=SnakeUSBIP",
+                 "--why=Detach imported USB/IP devices before sleep", "sleep", "infinity"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                start_new_session=True)
+        except OSError as e:
+            self.log("error", f"Could not start systemd-inhibit: {e}")
+            return False
+        for _ in range(30):
+            if self.inhibitor.poll() is not None:
+                err = (self.inhibitor.stderr.read() or b"").decode(errors="ignore").strip()
+                self.log("error", f"systemd-inhibit exited: {err or self.inhibitor.returncode}")
+                return False
+            if self.inhibitor.pid in self.inhibitor_pids():
+                return True
+            time.sleep(0.1)
+        self.log("warning", "Delay inhibitor not visible in logind yet.")
+        return True
+
+    def release_inhibitor(self):
+        proc, self.inhibitor = self.inhibitor, None
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, 15)
+            except OSError:
+                proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    @staticmethod
+    def inhibitor_pids():
+        rc, out, _ = run_bounded(["busctl", "--system", "--json=short", "call", "org.freedesktop.login1",
+                                  "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                  "ListInhibitors"], timeout=3)
+        try:
+            return {i[5] for i in json.loads(out)["data"][0] if i[1] == "SnakeUSBIP"} if rc == 0 else set()
+        except Exception:
+            return set()
+
+    def refresh_logind_owner(self):
+        rc, out, _ = run_bounded(["busctl", "--system", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                  "org.freedesktop.DBus", "GetNameOwner", "s", "org.freedesktop.login1"], timeout=3)
+        m = re.search(r'"(:[\d.]+)"', out) if rc == 0 else None
+        self.logind_owner = m.group(1) if m else None
+        return self.logind_owner
+
+    def parse_signal(self, line):
+        """Return True/False for a genuine logind PrepareForSleep signal line, else None."""
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            return None
+        if (msg.get("type") != "signal" or msg.get("member") != "PrepareForSleep"
+                or msg.get("interface") != "org.freedesktop.login1.Manager"
+                or msg.get("path") != "/org/freedesktop/login1"):
+            return None
+        data = (msg.get("payload") or {}).get("data") or []
+        if not data or not isinstance(data[0], bool):
+            return None
+        sender = msg.get("sender")
+        if sender != self.logind_owner and sender != self.refresh_logind_owner():
+            self.log("warning", f"Ignoring PrepareForSleep from {sender} (logind is {self.logind_owner}).")
+            return None
+        return data[0]
+
+    # ── sleep / resume handlers ──
+    def on_prepare_sleep(self):
+        t0 = time.monotonic()
+        deadline = t0 + GUARD_SLEEP_BUDGET
+        self.log("info", "PrepareForSleep(true): detaching imported USB/IP devices.")
+        self.cancel_restore(wait=1.0)
+        with client_lock(timeout=max(0.2, deadline - time.monotonic() - 2.5)) as locked:
+            if not locked:
+                self.log("warning", "Client lock busy (manual attach/detach?): detaching anyway.")
+            ok = client_suspend_detach(deadline, self.log)
+        self.release_inhibitor()
+        took = time.monotonic() - t0
+        if ok:
+            self.log("info", f"Ready for sleep after {took:.2f}s, inhibitor released.")
+        else:
+            self.log("error", f"Some ports were not released ({took:.2f}s); inhibitor released anyway.")
+
+    def on_resume(self):
+        self.log("info", "PrepareForSleep(false): resumed or sleep aborted.")
+        self.take_inhibitor()
+        self.start_restore()
+
+    def cancel_restore(self, wait=0.0):
+        self.restore_cancel.set()
+        t = self.restore_thread
+        if t and t.is_alive() and wait:
+            t.join(wait)
+
+    def start_restore(self):
+        if not load_client_state():
+            return
+        self.cancel_restore(wait=2.0)
+        self.restore_cancel = threading.Event()
+        self.restore_thread = threading.Thread(target=self.restore_loop, args=(self.restore_cancel,), daemon=True)
+        self.restore_thread.start()
+
+    def force_rebind(self, ip, busid):
+        un = send_control_command(ip, f"UNBIND {busid}", timeout=2.0)
+        time.sleep(0.5)
+        bi = send_control_command(ip, f"BIND {busid}", timeout=2.0)
+        self.log("warning", f"Forced UNBIND+BIND of {busid} on {ip} to drop a stale session "
+                            f"(unbind={un and un.get('status')}, bind={bi and bi.get('status')}).")
+
+    def restore_loop(self, cancel, window=GUARD_RESTORE_WINDOW, max_delay=10.0):
+        start = time.monotonic()
+        first_fail = {}
+        forced = set()
+        delay = min(1.0, max_delay)
+        while not cancel.is_set():
+            pending = load_client_state()
+            if not pending:
+                self.log("info", "All USB/IP devices restored.")
+                return
+            for dev in pending:
+                if cancel.is_set():
+                    return
+                ip, busid = dev["ip"], dev["busid"]
+                key = (ip, busid)
+                if not tcp_reachable(ip, PORT, timeout=1.5):
+                    continue
+                with client_lock(timeout=5) as locked:
+                    if not locked or cancel.is_set():
+                        continue
+                    if dev not in load_client_state():
+                        continue  # cancelled by a manual detach
+                    ok, msg = attach_remote_device(ip, busid, attach_timeout=8.0)
+                    if ok:
+                        save_client_state([d for d in load_client_state() if d != dev])
+                if ok:
+                    self.log("info", f"Restored {ip}/{busid}: {msg}")
+                    continue
+                self.log("warning", f"Restore of {ip}/{busid} failed: {msg}")
+                first_fail.setdefault(key, time.monotonic())
+                if key not in forced and time.monotonic() - first_fail[key] >= GUARD_FORCE_REBIND_AFTER:
+                    forced.add(key)
+                    self.force_rebind(ip, busid)
+            if time.monotonic() - start >= window:
+                left = load_client_state()
+                if left:
+                    unreachable = [f"{d['ip']}/{d['busid']}" for d in left if (d["ip"], d["busid"]) not in first_fail]
+                    self.log("error", f"Gave up restoring after {window:.0f}s: "
+                                      f"{', '.join(d['ip'] + '/' + d['busid'] for d in left)}"
+                                      + (f" (server never reachable: {', '.join(unreachable)})" if unreachable else "")
+                                      + ". Reconnect manually with 'snakeusbip-ctl connect'.")
+                    save_client_state([])
+                return
+            cancel.wait(delay)
+            delay = min(delay * 1.5, max_delay)
+
+    # ── main loop ──
+    def handle_line(self, line):
+        value = self.parse_signal(line)
+        if value is True:
+            self.on_prepare_sleep()
+        elif value is False:
+            self.on_resume()
+
+    def stop(self, *_):
+        self.stopping.set()
+        self.cancel_restore()
+        mon = self.monitor
+        if mon and mon.poll() is None:
+            mon.terminate()
+
+    def run(self):
+        import signal
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        if not shutil.which("busctl") or not shutil.which("systemd-inhibit"):
+            self.log("error", "busctl and systemd-inhibit (systemd) are required.")
+            return False
+        self.refresh_logind_owner()
+        self.log("info", f"SnakeUSBIP client sleep guard v{VERSION} started (logind {self.logind_owner}).")
+        try:
+            while not self.stopping.is_set():
+                self.monitor = subprocess.Popen(
+                    ["busctl", "--system", "--json=short", "monitor", "--match",
+                     "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                # Subscribe first, then inhibit, so no PrepareForSleep can slip in between.
+                time.sleep(0.3)
+                self.take_inhibitor()
+                if load_client_state():
+                    self.log("info", "Pending devices from a previous sleep: restoring.")
+                    self.start_restore()
+                for line in self.monitor.stdout:
+                    if self.stopping.is_set():
+                        break
+                    try:
+                        self.handle_line(line)
+                    except Exception as e:
+                        self.log("error", f"Error handling sleep signal: {e}")
+                        self.take_inhibitor()
+                if not self.stopping.is_set():
+                    self.log("warning", f"busctl monitor exited ({self.monitor.wait()}), restarting.")
+                    self.stopping.wait(2)
+        finally:
+            self.release_inhibitor()
+            if self.monitor and self.monitor.poll() is None:
+                self.monitor.terminate()
+            self.log("info", "Client sleep guard stopped.")
+        return True
+
+def run_client_sleep_hook(phase="pre"):
+    """Fallback for sleep.target: detach anything still attached (e.g. guard not running)."""
+    if phase != "pre":
+        glog("error", f"Unknown sleep hook phase '{phase}' (only 'pre' is supported).")
+        return False
+    deadline = time.monotonic() + 8.0
+    with client_lock(timeout=3) as locked:
+        if not locked:
+            glog("warning", "Client lock busy: detaching anyway.")
+        return client_suspend_detach(deadline)
+
+def _guard_units():
+    exe = f"{sys.executable} {os.path.realpath(__file__)}"
+    guard = f"""[Unit]
+Description=SnakeUSBIP client sleep guard (detach imported USB/IP devices before sleep, restore on resume)
+After=dbus.service systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart={exe} client-guard run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+    hook = f"""[Unit]
+Description=SnakeUSBIP: detach imported USB/IP devices before sleep (fallback)
+Before=sleep.target
+
+[Service]
+Type=oneshot
+ExecStart={exe} client-sleep-hook pre
+TimeoutStartSec=15
+
+[Install]
+WantedBy=sleep.target
+"""
+    return {GUARD_UNIT: guard, SLEEP_UNIT: hook}
+
+def manage_client_guard(action="status"):
+    """client-guard run|install|uninstall|status"""
+    action = (action or "status").lower()
+    if action == "status":
+        for unit in (GUARD_UNIT, SLEEP_UNIT):
+            enabled = run_cmd(["systemctl", "is-enabled", unit]) or "not installed"
+            active = run_cmd(["systemctl", "is-active", unit]) or "unknown"
+            print(f"{unit:<36} enabled: {enabled:<14} active: {active}")
+        pids = ClientSleepGuard.inhibitor_pids() if shutil.which("busctl") else set()
+        print(f"Sleep delay inhibitor:               {GREEN + 'held' + RESET if pids else YELLOW + 'not held' + RESET}")
+        pending = load_client_state()
+        print(f"Pending restore:                     {', '.join(d['ip'] + '/' + d['busid'] for d in pending) or 'none'}")
+        return True
+    if not IS_LINUX:
+        print(f"{RED}[Error] The client sleep guard is only supported on Linux with systemd.{RESET}")
+        return False
+    if not is_root():
+        print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
+        return rerun_with_sudo("client-guard", action)
+    if action == "run":
+        return ClientSleepGuard().run()
+    if action == "install":
+        try:
+            for name, text in _guard_units().items():
+                with open(os.path.join(SYSTEMD_UNIT_DIR, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+        except OSError as e:
+            print(f"{RED}✗ Could not write systemd units: {e}{RESET}")
+            return False
+        steps = [["systemctl", "daemon-reload"], ["systemctl", "enable", SLEEP_UNIT],
+                 ["systemctl", "enable", GUARD_UNIT], ["systemctl", "restart", GUARD_UNIT]]
+        for cmd in steps:
+            rc, out, err = run_cmd_result(cmd)
+            if rc != 0:
+                print(f"{RED}✗ {' '.join(cmd)}: {err or out or f'exit code {rc}'}{RESET}")
+                return False
+        for _ in range(30):
+            if ClientSleepGuard.inhibitor_pids():
+                print(f"{GREEN}✓ Client sleep guard installed and running (delay inhibitor held).{RESET}")
+                return True
+            time.sleep(0.2)
+        print(f"{RED}✗ Guard started but its inhibitor is not visible: check 'journalctl -u {GUARD_UNIT}'.{RESET}")
+        return False
+    if action == "uninstall":
+        run_cmd_result(["systemctl", "disable", "--now", GUARD_UNIT, SLEEP_UNIT])
+        for name in (GUARD_UNIT, SLEEP_UNIT):
+            try:
+                os.remove(os.path.join(SYSTEMD_UNIT_DIR, name))
+            except FileNotFoundError:
+                pass
+        run_cmd_result(["systemctl", "daemon-reload"])
+        print(f"{GREEN}✓ Client sleep guard removed.{RESET}")
+        return True
+    print("Usage: snakeusbip-ctl client-guard [status|install|uninstall|run]")
+    return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCHER
@@ -1534,7 +2171,8 @@ def main():
                         choices=["dashboard", "status", "start", "stop", "restart",
                                  "list", "share", "unshare", "policy", "auto-unbind",
                                  "dynamic-daemon", "fix-dualsense", "doctor", "test", "logs",
-                                 "scan", "remote", "connect", "attach", "disconnect", "detach", "ports", "mode"],
+                                 "scan", "remote", "connect", "attach", "disconnect", "detach", "ports", "mode",
+                                 "client-guard", "client-sleep-hook"],
                         help="Action to perform (default: interactive dashboard)")
     parser.add_argument("busid", nargs="?", default=None, help="Target USB bus ID or action parameter")
     parser.add_argument("extra", nargs="?", default=None, help="Additional argument for policy management")
@@ -1676,6 +2314,10 @@ def main():
         sys.exit(0 if ok else 1)
     elif args.command == "ports":
         list_client_ports()
+    elif args.command == "client-guard":
+        sys.exit(0 if manage_client_guard(args.busid or "status") else 1)
+    elif args.command == "client-sleep-hook":
+        sys.exit(0 if run_client_sleep_hook(args.busid or "pre") else 1)
 
 if __name__ == "__main__":
     try:

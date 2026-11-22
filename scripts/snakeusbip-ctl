@@ -40,6 +40,9 @@ YELLOW = "\033[93m"
 RED = "\033[91m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
+GUARD_COLOR = "\033[38;5;202m"
+SERVER_COLOR = "\033[38;5;214m"
+CLIENT_COLOR = "\033[38;5;157m"
 RESET = "\033[0m"
 
 
@@ -972,7 +975,9 @@ def choose_item(label, items, validator, free_text_hint):
         print(f"{YELLOW}Invalid {label}: {value}{RESET}")
 
 ROLES = ("server", "client", "both")
-ROLE_LABELS = {"server": "Server", "client": "Client", "both": "Server + Client"}
+ROLE_LABELS = {"server": f"{SERVER_COLOR}Server{RESET}",
+               "client": f"{CLIENT_COLOR}Client{RESET}",
+               "both": f"{SERVER_COLOR}Server{RESET} + {CLIENT_COLOR}Client{RESET}"}
 
 def _role_config_path():
     """Per-user config file. Under sudo it still points to the invoking user's home."""
@@ -1021,8 +1026,8 @@ def ask_role(current=None):
     default_idx = ROLES.index(default) + 1
     print(f"""
 {BOLD}How will you use SnakeUSBIP on this computer?{RESET}
-  {BOLD}[1]{RESET} {BOLD}Server{RESET}  — share this computer's USB devices with other computers
-  {BOLD}[2]{RESET} {BOLD}Client{RESET}  — use USB devices shared by another computer
+  {BOLD}{SERVER_COLOR}[1] Server{RESET}  — share this computer's USB devices with other computers
+  {BOLD}{CLIENT_COLOR}[2] Client{RESET}  — use USB devices shared by another computer
   {BOLD}[3]{RESET} {BOLD}Both{RESET}
 """)
     while True:
@@ -1083,7 +1088,64 @@ def get_attached_ports():
         return None, None
     return entries, err
 
+class DashboardGuard:
+    """Own a temporary guard through a pipe; EOF also handles a crashed dashboard."""
+    def __init__(self):
+        self.process = None
+
+    def active(self):
+        return self.process is not None and self.process.poll() is None
+
+    def stop(self):
+        if self.process is not None:
+            if self.process.stdin:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print(f"{RED}Temporary guard has not stopped yet; check the journal.{RESET}")
+                return False
+            self.process = None
+        return True
+
+    def start(self):
+        if self.active():
+            return True
+        cmd = [sys.executable, os.path.realpath(__file__), "client-guard", "session"]
+        if not is_root():
+            if not shutil.which("sudo"):
+                return False
+            if subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode != 0:
+                if subprocess.run(["sudo", "-v"]).returncode != 0:
+                    return False
+            cmd = ["sudo", "-n", *cmd]
+        before = ClientSleepGuard.inhibitor_pids()
+        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                        stdout=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(40):
+            if not self.active():
+                self.stop()
+                return False
+            if ClientSleepGuard.inhibitor_pids() - before:
+                return True
+            time.sleep(0.2)
+        self.stop()
+        return False
+
+
 def render_dashboard(role=None):
+    temporary = DashboardGuard()
+    try:
+        _render_dashboard(role, temporary)
+    finally:
+        temporary.stop()
+
+
+def _render_dashboard(role, temporary):
     """Interactive Control Suite Terminal Dashboard, split into Server and Client sections."""
     role = role if role in ROLES else "both"
     while True:
@@ -1100,7 +1162,7 @@ def render_dashboard(role=None):
 
         print(f"""
 {CYAN}╔══════════════════════════════════════════════════════════════════════════════╗
-║                 🎛️  {BOLD}SnakeUSBIP Control Suite v{VERSION}{RESET}{CYAN}                           ║
+║                 🎛️  {BOLD}SnakeUSBIP Control Suite v{VERSION}{RESET}{CYAN}                          ║
 ║   Share local USB peripherals over network (Moonlight/Sunshine/Sim/Work)     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝{RESET}
   • {BOLD}OS:{RESET} {st['os']}  |  {BOLD}LAN IP:{RESET} {BOLD}{GREEN}{lan_ip}{RESET}
@@ -1110,7 +1172,7 @@ def render_dashboard(role=None):
             status_badge = f"{GREEN}● ACTIVE{RESET}" if st["running"] else f"{RED}○ STOPPED{RESET}"
             port_badge = f"{GREEN}OPEN (Port {PORT}){RESET}" if st["port_active"] else f"{RED}CLOSED{RESET}"
             print(f"""
-{CYAN}══════════════ 🖥️  SERVER — share this computer's USB devices ══════════════{RESET}
+{SERVER_COLOR}══════════════ 🖥️  SERVER — share this computer's USB devices ══════════════{RESET}
   • {BOLD}Server Daemon:{RESET} {status_badge} ({st['service_manager']})  |  {BOLD}Port 3240:{RESET} {port_badge}
   • Clients connect to {BOLD}{GREEN}{lan_ip}{RESET} (enter this IP in the SnakeUSBIP client)
 
@@ -1129,7 +1191,7 @@ def render_dashboard(role=None):
 
         if is_client:
             print(f"""
-{CYAN}══════════════ 💻 CLIENT — use USB devices from another computer ══════════════{RESET}""")
+{CLIENT_COLOR}══════════════ 💻 CLIENT — use USB devices from another computer ══════════════{RESET}""")
             if not IS_LINUX:
                 print(f"  {YELLOW}Client mode (vhci_hcd attach) is only supported on Linux.{RESET}")
             elif ports is None:
@@ -1143,21 +1205,27 @@ def render_dashboard(role=None):
                 for e in ports:
                     remote_str = f"{e['ip']}/{e['busid']}" if e["ip"] or e["busid"] else "remote"
                     print(f"    • Port {BOLD}{e['port']}{RESET}: {remote_str} — {e['desc']}")
-                guard = run_cmd(["systemctl", "is-active", GUARD_UNIT], timeout=5) if shutil.which("systemctl") else ""
-                guard_str = (f"{GREEN}active{RESET}" if guard == "active"
-                             else f"{YELLOW}off{RESET} {DIM}(sudo snakeusbip-ctl client-guard install){RESET}")
-                print(f"  • {BOLD}Sleep guard:{RESET} {guard_str}")
             print(f"""
   {BOLD}[9]{RESET} Connect Remote USB            {BOLD}[0]{RESET} Detach Remote USB""")
+            if IS_LINUX:
+                guard = run_cmd(["systemctl", "is-active", GUARD_UNIT], timeout=5) if shutil.which("systemctl") else ""
+                print(f"\n{GUARD_COLOR}────────────── SLEEP PROTECTION (optional) ──────────────{RESET}")
+                mode = "temporary — until this menu closes" if temporary.active() else (
+                    "background service" if guard == "active" else "disabled")
+                color = GREEN if temporary.active() or guard == "active" else GUARD_COLOR
+                print(f"  {BOLD}{GUARD_COLOR}[g] Client guard mode{RESET}: {color}{mode}{RESET}")
 
         print(f"""
 {CYAN}══════════════════════════════════════════════════════════════════════════════{RESET}
-  {BOLD}[5]{RESET} Health Doctor   {BOLD}[8]{RESET} Refresh   {BOLD}[m]{RESET} Change mode   {BOLD}[q]{RESET} Quit
+  {BOLD}{CYAN}[m] Change mode: Server / Client / Both{RESET}
+  {BOLD}[5]{RESET} Health Doctor   {BOLD}[8]{RESET} Refresh   {BOLD}[q]{RESET} Quit
 """)
 
         valid = ["5", "8", "m"] + (["1", "2", "3", "4", "6", "7"] if is_server else []) + (["9", "0"] if is_client else [])
+        if is_client and IS_LINUX:
+            valid.append("g")
         keys = "0-9" if (is_server and is_client) else ", ".join(sorted(k for k in valid if k.isdigit()))
-        keys += ", m, q"
+        keys += (", g" if "g" in valid else "") + ", m, q"
         try:
             choice = input(f"{BOLD}Select an action [{keys}]: {RESET}").strip().lower()
         except (KeyboardInterrupt, EOFError):
@@ -1177,6 +1245,37 @@ def render_dashboard(role=None):
                 if new_role != role:
                     role = new_role
                     save_role(role)
+            elif choice == "g":
+                print(f"  {GUARD_COLOR}[0] Disabled{RESET}")
+                print(f"  {GREEN}[1] Temporary — only while this menu is open{RESET}")
+                print(f"  {GREEN}[2] Permanent — background service, starts at boot{RESET}")
+                action = ask("Select guard mode [0-2] (Enter/q = back): ")
+                if action not in ("0", "1", "2"):
+                    continue
+                svc_present = any(os.path.exists(os.path.join(SYSTEMD_UNIT_DIR, u)) for u in (GUARD_UNIT, SLEEP_UNIT))
+                if action == "1" and temporary.active() and not svc_present:
+                    print(f"{GREEN}✓ Temporary guard is already active until this menu closes.{RESET}")
+                    pause()
+                    continue
+                was_temp = temporary.active()
+                if not temporary.stop():
+                    pause()
+                    continue
+                if action == "2":
+                    manage_client_guard("install")
+                elif action == "0":
+                    if svc_present:
+                        manage_client_guard("uninstall")
+                    elif was_temp:
+                        print(f"{GREEN}✓ Temporary client sleep guard stopped.{RESET}")
+                    else:
+                        print(f"{DIM}Client sleep guard is already disabled.{RESET}")
+                elif action == "1":
+                    if not svc_present or manage_client_guard("uninstall"):
+                        ok = temporary.start()
+                        print(f"{GREEN}✓ Temporary guard active until this menu closes.{RESET}" if ok else
+                              f"{RED}✗ Could not start temporary guard.{RESET}")
+                pause()
             elif choice == "1":
                 start_service()
                 pause()
@@ -1979,6 +2078,17 @@ class ClientSleepGuard:
             mon.terminate()
 
     def run(self):
+        import fcntl
+        os.makedirs(CLIENT_RUN_DIR, mode=0o755, exist_ok=True)
+        with open(os.path.join(CLIENT_RUN_DIR, "guard.lock"), "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.log("error", "Another client guard is running; close its menu first.")
+                return False
+            return self._run()
+
+    def _run(self):
         import signal
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
@@ -1995,6 +2105,8 @@ class ClientSleepGuard:
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
                 # Subscribe first, then inhibit, so no PrepareForSleep can slip in between.
                 time.sleep(0.3)
+                if self.stopping.is_set():
+                    break
                 self.take_inhibitor()
                 if load_client_state():
                     self.log("info", "Pending devices from a previous sleep: restoring.")
@@ -2078,6 +2190,19 @@ def manage_client_guard(action="status"):
         return rerun_with_sudo("client-guard", action)
     if action == "run":
         return ClientSleepGuard().run()
+    if action == "session":
+        guard = ClientSleepGuard()
+        def watch_dashboard():
+            try:
+                fd = sys.stdin.fileno()
+                while os.read(fd, 1):
+                    pass
+            except OSError:
+                pass
+            finally:
+                guard.stop()
+        threading.Thread(target=watch_dashboard, daemon=True).start()
+        return guard.run()
     if action == "install":
         try:
             for name, text in _guard_units().items():
@@ -2086,6 +2211,7 @@ def manage_client_guard(action="status"):
         except OSError as e:
             print(f"{RED}✗ Could not write systemd units: {e}{RESET}")
             return False
+        before = ClientSleepGuard.inhibitor_pids()
         steps = [["systemctl", "daemon-reload"], ["systemctl", "enable", SLEEP_UNIT],
                  ["systemctl", "enable", GUARD_UNIT], ["systemctl", "restart", GUARD_UNIT]]
         for cmd in steps:
@@ -2094,20 +2220,29 @@ def manage_client_guard(action="status"):
                 print(f"{RED}✗ {' '.join(cmd)}: {err or out or f'exit code {rc}'}{RESET}")
                 return False
         for _ in range(30):
-            if ClientSleepGuard.inhibitor_pids():
+            if ClientSleepGuard.inhibitor_pids() - before:
                 print(f"{GREEN}✓ Client sleep guard installed and running (delay inhibitor held).{RESET}")
                 return True
             time.sleep(0.2)
         print(f"{RED}✗ Guard started but its inhibitor is not visible: check 'journalctl -u {GUARD_UNIT}'.{RESET}")
         return False
     if action == "uninstall":
-        run_cmd_result(["systemctl", "disable", "--now", GUARD_UNIT, SLEEP_UNIT])
+        for name in (GUARD_UNIT, SLEEP_UNIT):
+            if not os.path.exists(os.path.join(SYSTEMD_UNIT_DIR, name)):
+                continue
+            rc, out, err = run_cmd_result(["systemctl", "disable", "--now", name])
+            if rc != 0:
+                print(f"{RED}Could not disable {name}: {err or out}{RESET}")
+                return False
         for name in (GUARD_UNIT, SLEEP_UNIT):
             try:
                 os.remove(os.path.join(SYSTEMD_UNIT_DIR, name))
             except FileNotFoundError:
                 pass
-        run_cmd_result(["systemctl", "daemon-reload"])
+        rc, out, err = run_cmd_result(["systemctl", "daemon-reload"])
+        if rc != 0:
+            print(f"{RED}Could not reload systemd: {err or out}{RESET}")
+            return False
         print(f"{GREEN}✓ Client sleep guard removed.{RESET}")
         return True
     print("Usage: snakeusbip-ctl client-guard [status|install|uninstall|run]")

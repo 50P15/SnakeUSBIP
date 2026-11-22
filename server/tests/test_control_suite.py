@@ -497,5 +497,51 @@ class TestClientSleepGuard(unittest.TestCase):
         self.assertIn("client-sleep-hook pre", hook)
         self.assertIn("client-guard run", units["snakeusbip-client-guard.service"])
 
+    def test_guard_lock_prevents_second_instance(self):
+        import fcntl
+        mod = self.mod
+        os.makedirs(mod.CLIENT_RUN_DIR, exist_ok=True)
+        with open(os.path.join(mod.CLIENT_RUN_DIR, "guard.lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            g = mod.ClientSleepGuard(log=self.log)
+            self.assertFalse(g.run())
+        self.assertTrue(any(l == "error" and "Another client guard" in m for l, m in self.logs), self.logs)
+
+    def test_dashboard_guard_waits_for_new_inhibitor_pid(self):
+        mod = self.mod
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        fake_proc.stdin = mock.Mock()
+        pids_seq = iter([{100}, {100}, {100, 200}])
+        with mock.patch.object(mod.subprocess, "Popen", return_value=fake_proc), \
+             mock.patch.object(mod.ClientSleepGuard, "inhibitor_pids", side_effect=lambda: next(pids_seq)), \
+             mock.patch.object(mod.time, "sleep"):
+            dg = mod.DashboardGuard()
+            self.assertTrue(dg.start())
+            self.assertTrue(dg.stop())
+        fake_proc.stdin.close.assert_called_once()
+
+    def test_dashboard_guard_menu_switches_modes_and_stops_on_exit(self):
+        mod = self.mod
+        answers = iter(["g", "1", "", "g", "2", "", "g", "0", "", "q"])
+        temp = mock.Mock()
+        temp.active.return_value = False
+        temp.start.return_value = True
+        temp.stop.return_value = True
+        with mock.patch("builtins.input", side_effect=lambda prompt="": next(answers)), \
+             mock.patch.object(mod.os, "system"), \
+             mock.patch.object(mod, "DashboardGuard", return_value=temp), \
+             mock.patch.object(mod, "get_service_status", return_value={
+                 "os": "Linux", "service_manager": "systemd", "running": False, "port_active": False}), \
+             mock.patch.object(mod, "get_lan_ip", return_value="192.168.1.10"), \
+             mock.patch.object(mod, "get_attached_ports", return_value=([], None)), \
+             mock.patch.object(mod, "run_cmd", return_value="inactive"), \
+             mock.patch.object(mod, "SYSTEMD_UNIT_DIR", self.tmp.name), \
+             mock.patch.object(mod, "manage_client_guard", return_value=True) as mg:
+            mod.render_dashboard("client")
+        temp.start.assert_called_once()
+        mg.assert_called_once_with("install")
+        self.assertGreaterEqual(temp.stop.call_count, 2)
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ This directory contains provisioning scripts, control suites, and media automati
 ### 1. `snakeusbip-ctl` — Unified Control Suite (macOS & Linux)
 Interactive Terminal User Interface (TUI) dashboard and CLI management tool with zero external dependencies.
 - **Interactive TUI Dashboard**: `snakeusbip-ctl` (or `snakeusbip-ctl dashboard`)
+- **Dashboard Mode**: `snakeusbip-ctl mode [server|client|both]` (asked on first launch; switch anytime with `[m]`)
 - **System Doctor**: `snakeusbip-ctl doctor`
 - **Protocol Loopback Test**: `snakeusbip-ctl test`
 - **Service Control**: `sudo snakeusbip-ctl start|stop|restart|status`

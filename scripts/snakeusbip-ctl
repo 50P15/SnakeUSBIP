@@ -182,9 +182,43 @@ def run_cmd(cmd, capture=True, check=False, timeout=30):
             raise
         return ""
 
+def run_cmd_result(cmd, timeout=30):
+    """Run a command and return (returncode, stdout, stderr). returncode is None if it could not run."""
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, timeout=timeout)
+        return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return None, "", f"timed out after {timeout}s"
+    except Exception as e:
+        return None, "", str(e)
+
 def is_root():
     """Check if script is running with superuser privileges."""
     return os.geteuid() == 0 if hasattr(os, "geteuid") else False
+
+def build_sudo_command(*args):
+    """Build the argv used to re-run this script with sudo for one explicit subcommand."""
+    return ["sudo", sys.executable, os.path.realpath(__file__), *[str(a) for a in args]]
+
+def rerun_with_sudo(*args):
+    """
+    Re-run this script with sudo for one explicit subcommand (e.g. "connect", ip, busid).
+    Never re-uses sys.argv: in the interactive dashboard sys.argv has no subcommand, so
+    re-running it would just open a second dashboard and drop the requested action.
+    """
+    if not shutil.which("sudo"):
+        print(f"{RED}[Error] 'sudo' not found. Run as root: snakeusbip-ctl {' '.join(str(a) for a in args)}{RESET}")
+        return False
+    sys.stdout.flush()
+    try:
+        return subprocess.run(build_sudo_command(*args)).returncode == 0
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Cancelled.{RESET}")
+        return False
+    except OSError as e:
+        print(f"{RED}[Error] Could not run sudo: {e}{RESET}")
+        return False
 
 def get_lan_ip():
     """Find local LAN IPv4 address."""
@@ -253,7 +287,7 @@ def start_service():
     """Start the USB/IP server service."""
     if not is_root():
         print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
+        return rerun_with_sudo("start")
 
     if IS_MACOS:
         plist = "/Library/LaunchDaemons/com.snakeusbip.server.plist"
@@ -266,7 +300,10 @@ def start_service():
             subprocess.Popen(["snakeusbip-server-mac", "serve", "--auto-bind"])
             return True
     elif IS_LINUX:
-        run_cmd(["systemctl", "restart", "usbipd"])
+        rc, _, err = run_cmd_result(["systemctl", "restart", "usbipd"])
+        if rc != 0:
+            print(f"{RED}✗ Failed to start usbipd via systemd: {err or f'exit code {rc}'}{RESET}")
+            return False
         print(f"{GREEN}✓ Linux service started via systemd.{RESET}")
         return True
     return False
@@ -275,7 +312,7 @@ def stop_service():
     """Stop the USB/IP server service."""
     if not is_root():
         print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
+        return rerun_with_sudo("stop")
 
     if IS_MACOS:
         plist = "/Library/LaunchDaemons/com.snakeusbip.server.plist"
@@ -515,7 +552,7 @@ def share_device(busid):
 
     if not is_root():
         print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
+        return rerun_with_sudo("share", busid)
 
     if IS_MACOS:
         bin_path = shutil.which("snakeusbip-server-mac")
@@ -537,7 +574,7 @@ def unshare_device(busid):
 
     if not is_root():
         print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
+        return rerun_with_sudo("unshare", busid)
 
     if IS_MACOS:
         bin_path = shutil.which("snakeusbip-server-mac")
@@ -847,6 +884,9 @@ def run_doctor():
         host_str = f"{GREEN}LOADED{RESET}" if has_host else f"{RED}MISSING (run: sudo modprobe usbip_host){RESET}"
         print(f"• Kernel Module core: {core_str}")
         print(f"• Kernel Module host: {host_str}")
+        has_vhci = "vhci_hcd" in lsmod or os.path.exists("/sys/devices/platform/vhci_hcd.0")
+        vhci_str = f"{GREEN}LOADED{RESET}" if has_vhci else f"{DIM}not loaded (client only; loaded automatically on connect){RESET}"
+        print(f"• Kernel Module vhci: {vhci_str}")
 
         # Check Raspberry Pi legacy dwc_otg driver (causes kernel Oops in stub_send_ret_submit behind USB 2.0 Hub HATs)
         if os.path.exists("/sys/bus/platform/drivers/dwc_otg") and any(
@@ -877,103 +917,313 @@ def run_doctor():
 # INTERACTIVE DASHBOARD / TUI
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_dashboard():
-    """Interactive Control Suite Terminal Dashboard."""
+CANCEL_WORDS = ("q", "quit", "exit", "cancel")
+
+class PromptCancelled(Exception):
+    """Raised when the user cancels an interactive prompt (q, empty input, Ctrl+C or Ctrl+D)."""
+
+def ask(prompt_text):
+    """input() that turns Ctrl+C, Ctrl+D and cancel words into PromptCancelled."""
+    try:
+        value = input(prompt_text).strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        raise PromptCancelled()
+    if value.lower() in CANCEL_WORDS:
+        raise PromptCancelled()
+    return value
+
+def pause(message="Press Enter to return to Dashboard..."):
+    """Wait for Enter so the user can read the output before the screen is cleared."""
+    try:
+        input(f"\n{DIM}{message}{RESET}")
+    except (KeyboardInterrupt, EOFError):
+        print()
+
+def choose_item(label, items, validator, free_text_hint):
+    """
+    Let the user pick one of `items` by its number, or type a value accepted by `validator`.
+    `items` may contain None for entries that cannot be selected by number.
+    Raises PromptCancelled on empty input, q, Ctrl+C or Ctrl+D.
+    """
+    selectable = any(items)
+    if selectable:
+        choices = "1" if len(items) == 1 else f"1-{len(items)}"
+        prompt_text = f"Select {label} [{choices}] or type {free_text_hint} (q to cancel): "
+    else:
+        prompt_text = f"Enter {free_text_hint} (q to cancel): "
+    while True:
+        value = ask(prompt_text)
+        if not value:
+            raise PromptCancelled()
+        if value.isdigit():
+            n = int(value)
+            if selectable and 1 <= n <= len(items) and items[n - 1]:
+                return items[n - 1]
+            if selectable and 1 <= n <= len(items):
+                print(f"{YELLOW}Entry {n} has no usable {label} identifier; type it instead.{RESET}")
+            elif selectable:
+                print(f"{YELLOW}Invalid number. Choose between 1 and {len(items)}.{RESET}")
+            else:
+                print(f"{YELLOW}Nothing to select by number; type {free_text_hint}.{RESET}")
+            continue
+        if validator(value):
+            return value
+        print(f"{YELLOW}Invalid {label}: {value}{RESET}")
+
+ROLES = ("server", "client", "both")
+ROLE_LABELS = {"server": "Server", "client": "Client", "both": "Server + Client"}
+
+def _role_config_path():
+    """Per-user config file. Under sudo it still points to the invoking user's home."""
+    home = None
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and is_root():
+        try:
+            import pwd
+            home = pwd.getpwnam(sudo_user).pw_dir
+        except Exception:
+            home = None
+    return os.path.join(home or os.path.expanduser("~"), ".config", "snakeusbip", "ctl.json")
+
+def load_role():
+    """Return the saved dashboard role ('server', 'client' or 'both'), or None."""
+    try:
+        with open(_role_config_path(), "r", encoding="utf-8") as f:
+            role = json.load(f).get("role")
+        return role if role in ROLES else None
+    except Exception:
+        return None
+
+def save_role(role):
+    """Persist the dashboard role. When running under sudo, keep the file owned by the real user."""
+    path = _role_config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"role": role}, f, indent=2)
+        uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+        if is_root() and uid and gid and uid.isdigit() and gid.isdigit():
+            for p in (os.path.dirname(path), path):
+                os.chown(p, int(uid), int(gid))
+        return True
+    except Exception as e:
+        print(f"{YELLOW}[!] Could not save role to {path}: {e}{RESET}")
+        return False
+
+def suggest_role():
+    """Default role: 'both' when the USB/IP server service is installed here, otherwise 'client'."""
+    return "both" if get_service_status().get("installed") else "client"
+
+def ask_role(current=None):
+    """Ask how this computer is used. Returns the chosen role (or `current` if cancelled)."""
+    default = current or suggest_role()
+    default_idx = ROLES.index(default) + 1
+    print(f"""
+{BOLD}How will you use SnakeUSBIP on this computer?{RESET}
+  {BOLD}[1]{RESET} {BOLD}Server{RESET}  — share this computer's USB devices with other computers
+  {BOLD}[2]{RESET} {BOLD}Client{RESET}  — use USB devices shared by another computer
+  {BOLD}[3]{RESET} {BOLD}Both{RESET}
+""")
+    while True:
+        try:
+            value = input(f"{BOLD}Select [1-3] (Enter = {default_idx}): {RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            if current:
+                return current
+            sys.exit(0)
+        if not value:
+            return default
+        if value in ("1", "2", "3"):
+            return ROLES[int(value) - 1]
+        if value in ROLES:
+            return value
+        print(f"{YELLOW}Invalid option.{RESET}")
+
+def offer_sudo_relaunch(role="both"):
+    """When the dashboard is opened without root, offer to relaunch it with sudo."""
+    if is_root() or not (IS_LINUX or IS_MACOS) or not sys.stdin.isatty() or not shutil.which("sudo"):
+        return
+    needs = []
+    if role in ("server", "both"):
+        needs.append("starting/stopping the service and sharing devices")
+    if role in ("client", "both"):
+        needs.append("connecting/detaching remote USB devices")
+    print(f"{YELLOW}[!] Running as a standard user: {' and '.join(needs)} require superuser privileges.{RESET}")
+    try:
+        answer = input(f"{BOLD}Relaunch the Control Suite with sudo now? [Y/n]: {RESET}").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(0)
+    if answer not in ("", "y", "yes", "s", "si", "sí"):
+        return
+    try:
+        # 'sudo -n true' succeeds silently with NOPASSWD rules; 'sudo -v' alone would still
+        # ask for a password unless *every* matching sudoers entry is NOPASSWD (verifypw=all).
+        no_pw = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode == 0
+        if not no_pw and subprocess.run(["sudo", "-v"]).returncode != 0:
+            print(f"{YELLOW}sudo authentication failed. Continuing as standard user.{RESET}")
+            time.sleep(1.5)
+            return
+        cmd = build_sudo_command("dashboard")
+        os.execvp(cmd[0], cmd)
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Continuing as standard user.{RESET}")
+        time.sleep(1)
+    except OSError as e:
+        print(f"{RED}[Error] Could not relaunch with sudo: {e}{RESET}")
+        time.sleep(1.5)
+
+def get_attached_ports():
+    """Return attached USB/IP client ports without printing, or None if 'usbip' is unavailable."""
+    bin_path = shutil.which("usbip")
+    if not bin_path:
+        return None
+    return parse_client_ports(run_cmd([bin_path, "port"], timeout=10))
+
+def render_dashboard(role=None):
+    """Interactive Control Suite Terminal Dashboard, split into Server and Client sections."""
+    role = role if role in ROLES else "both"
     while True:
         # Clear screen
         os.system("clear" if os.name != "nt" else "cls")
 
-        st = get_service_status()
+        is_server = role in ("server", "both")
+        is_client = role in ("client", "both")
         lan_ip = get_lan_ip()
-        devs = list_devices()
-
-        status_badge = f"{GREEN}● ACTIVE{RESET}" if st["running"] else f"{RED}○ STOPPED{RESET}"
-        port_badge = f"{GREEN}OPEN (Port {PORT}){RESET}" if st["port_active"] else f"{RED}CLOSED{RESET}"
+        st = get_service_status()
+        devs = list_devices() if is_server else []
+        ports = get_attached_ports() if (is_client and IS_LINUX) else None
+        privs = f"{GREEN}root{RESET}" if is_root() else f"{YELLOW}standard user (sudo will be requested){RESET}"
 
         print(f"""
 {CYAN}╔══════════════════════════════════════════════════════════════════════════════╗
 ║                 🎛️  {BOLD}SnakeUSBIP Control Suite v{VERSION}{RESET}{CYAN}                           ║
 ║   Share local USB peripherals over network (Moonlight/Sunshine/Sim/Work)     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝{RESET}
-  • {BOLD}OS:{RESET} {st['os']}
-  • {BOLD}Server Daemon:{RESET} {status_badge}  |  {BOLD}Port 3240:{RESET} {port_badge}
-  • {BOLD}Server IP (LAN):{RESET} {BOLD}{GREEN}{lan_ip}{RESET}  (Enter this IP in SnakeUSBIP Windows Client)
-  • {BOLD}Service Manager:{RESET} {st['service_manager']}
+  • {BOLD}OS:{RESET} {st['os']}  |  {BOLD}LAN IP:{RESET} {BOLD}{GREEN}{lan_ip}{RESET}
+  • {BOLD}Mode:{RESET} {BOLD}{ROLE_LABELS[role]}{RESET}  |  {BOLD}Privileges:{RESET} {privs}""")
 
-{BOLD}📋 Discovered Physical USB Peripherals ({len(devs)}):{RESET}""")
+        if is_server:
+            status_badge = f"{GREEN}● ACTIVE{RESET}" if st["running"] else f"{RED}○ STOPPED{RESET}"
+            port_badge = f"{GREEN}OPEN (Port {PORT}){RESET}" if st["port_active"] else f"{RED}CLOSED{RESET}"
+            print(f"""
+{CYAN}══════════════ 🖥️  SERVER — share this computer's USB devices ══════════════{RESET}
+  • {BOLD}Server Daemon:{RESET} {status_badge} ({st['service_manager']})  |  {BOLD}Port 3240:{RESET} {port_badge}
+  • Clients connect to {BOLD}{GREEN}{lan_ip}{RESET} (enter this IP in the SnakeUSBIP client)
 
-        if not devs:
-            print(f"  {YELLOW}No USB devices discovered or permission required.{RESET}")
-        else:
-            for idx, d in enumerate(devs[:8], start=1):
-                print(f"  {BOLD}[{idx}]{RESET} {d}")
-            if len(devs) > 8:
-                print(f"  {DIM}... ({len(devs) - 8} more devices){RESET}")
+  {BOLD}📋 Local USB Peripherals ({len(devs)}):{RESET}""")
+            if not devs:
+                print(f"    {YELLOW}No USB devices discovered or permission required.{RESET}")
+            else:
+                for idx, d in enumerate(devs[:8], start=1):
+                    print(f"    {BOLD}#{idx}{RESET}  {d.strip()}")
+                if len(devs) > 8:
+                    print(f"    {DIM}... ({len(devs) - 8} more devices){RESET}")
+            print(f"""
+  {BOLD}[1]{RESET} Start / Restart Service       {BOLD}[3]{RESET} Share a USB Device
+  {BOLD}[2]{RESET} Stop Service                  {BOLD}[4]{RESET} Unshare a USB Device
+  {BOLD}[6]{RESET} Protocol Self-Test            {BOLD}[7]{RESET} View Live Logs""")
+
+        if is_client:
+            print(f"""
+{CYAN}══════════════ 💻 CLIENT — use USB devices from another computer ══════════════{RESET}""")
+            if not IS_LINUX:
+                print(f"  {YELLOW}Client mode (vhci_hcd attach) is only supported on Linux.{RESET}")
+            elif ports is None:
+                print(f"  {YELLOW}'usbip' binary not found: install usbip / linux-tools to use client mode.{RESET}")
+            else:
+                print(f"  {BOLD}🔌 Remote USB devices attached here ({len(ports)}):{RESET}")
+                if not ports:
+                    print(f"    {DIM}None. Use [9] to connect one.{RESET}")
+                for e in ports:
+                    remote_str = f"{e['ip']}/{e['busid']}" if e["ip"] or e["busid"] else "remote"
+                    print(f"    • Port {BOLD}{e['port']}{RESET}: {remote_str} — {e['desc']}")
+            print(f"""
+  {BOLD}[9]{RESET} Connect Remote USB            {BOLD}[0]{RESET} Detach Remote USB""")
 
         print(f"""
-{CYAN}═══════════════════════════════ CONTROL ACTIONS ═══════════════════════════════{RESET}
-  {BOLD}[1]{RESET} Start / Restart Service       {BOLD}[5]{RESET} Run Health Doctor
-  {BOLD}[2]{RESET} Stop Service                  {BOLD}[6]{RESET} Run Protocol Self-Test
-  {BOLD}[3]{RESET} Share a USB Device            {BOLD}[7]{RESET} View Live Logs
-  {BOLD}[4]{RESET} Unshare a USB Device          {BOLD}[8]{RESET} Refresh Dashboard
-  {BOLD}[9]{RESET} Client: Connect Remote USB    {BOLD}[0]{RESET} Client: Detach Remote USB
-  {BOLD}[q]{RESET} Quit Control Suite
+{CYAN}══════════════════════════════════════════════════════════════════════════════{RESET}
+  {BOLD}[5]{RESET} Health Doctor   {BOLD}[8]{RESET} Refresh   {BOLD}[m]{RESET} Change mode   {BOLD}[q]{RESET} Quit
 """)
 
-        choice = input(f"{BOLD}Select an action [0-9, q]: {RESET}").strip().lower()
+        valid = ["5", "8", "m"] + (["1", "2", "3", "4", "6", "7"] if is_server else []) + (["9", "0"] if is_client else [])
+        keys = "0-9" if (is_server and is_client) else ", ".join(sorted(k for k in valid if k.isdigit()))
+        keys += ", m, q"
+        try:
+            choice = input(f"{BOLD}Select an action [{keys}]: {RESET}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            choice = "q"
+            print()
 
-        if choice == "1":
-            start_service()
-            time.sleep(2)
-        elif choice == "2":
-            stop_service()
-            time.sleep(1.5)
-        elif choice == "3":
-            bus = input("Enter USB Bus ID to share (e.g. 1-1): ").strip()
-            if bus:
-                share_device(bus)
-                time.sleep(2)
-        elif choice == "4":
-            bus = input("Enter USB Bus ID to unshare: ").strip()
-            if bus:
-                unshare_device(bus)
-                time.sleep(2)
-        elif choice == "5":
-            run_doctor()
-            input(f"\n{DIM}Press Enter to return to Dashboard...{RESET}")
-        elif choice == "6":
-            run_self_test()
-            input(f"\n{DIM}Press Enter to return to Dashboard...{RESET}")
-        elif choice == "7":
-            if IS_MACOS:
-                log_file = "/var/log/snakeusbip-server.log"
-                if os.path.exists(log_file):
-                    os.system(f"tail -n 30 {log_file}")
-                else:
-                    print("Log file /var/log/snakeusbip-server.log does not exist yet.")
-            elif IS_LINUX:
-                os.system("journalctl -u usbipd -n 30 --no-pager")
-            input(f"\n{DIM}Press Enter to return to Dashboard...{RESET}")
-        elif choice == "8" or choice == "":
-            continue
-        elif choice == "9":
-            scan_network_servers()
-            srv_ip = input("Enter Remote Server IP (e.g. 192.168.1.50): ").strip()
-            if srv_ip:
-                list_remote_devices(srv_ip)
-                rem_bus = input("Enter Remote Bus ID to attach (e.g. 1-1): ").strip()
-                if rem_bus:
-                    connect_remote_device(srv_ip, rem_bus)
-            input(f"\n{DIM}Press Enter to return to Dashboard...{RESET}")
-        elif choice == "0":
-            list_client_ports()
-            port_or_bus = input("Enter Port number, Bus ID, or 'all' to detach: ").strip()
-            if port_or_bus:
-                disconnect_remote_device(port_or_bus)
-            input(f"\n{DIM}Press Enter to return to Dashboard...{RESET}")
-        elif choice in ["q", "quit", "exit"]:
+        if choice in CANCEL_WORDS:
             print(f"\n{GREEN}Exiting SnakeUSBIP Control Suite. Have a great day!{RESET}\n")
             break
+        if choice not in valid:
+            continue
+
+        local_busids = [extract_busid(d) for d in devs[:8]]
+        try:
+            if choice == "m":
+                new_role = ask_role(role)
+                if new_role != role:
+                    role = new_role
+                    save_role(role)
+            elif choice == "1":
+                start_service()
+                pause()
+            elif choice == "2":
+                stop_service()
+                pause()
+            elif choice == "3":
+                bus = choose_item("device", local_busids, is_valid_busid, "a USB Bus ID to share (e.g. 1-1)")
+                share_device(bus)
+                pause()
+            elif choice == "4":
+                bus = choose_item("device", local_busids, is_valid_busid, "a USB Bus ID to unshare (e.g. 1-1)")
+                unshare_device(bus)
+                pause()
+            elif choice == "5":
+                run_doctor()
+                pause()
+            elif choice == "6":
+                run_self_test()
+                pause()
+            elif choice == "7":
+                if IS_MACOS:
+                    log_file = "/var/log/snakeusbip-server.log"
+                    if os.path.exists(log_file):
+                        os.system(f"tail -n 30 {log_file}")
+                    else:
+                        print("Log file /var/log/snakeusbip-server.log does not exist yet.")
+                elif IS_LINUX:
+                    os.system("journalctl -u usbipd -n 30 --no-pager")
+                pause()
+            elif choice == "8":
+                continue
+            elif choice == "9":
+                servers = scan_network_servers(numbered=True)
+                srv_ip = choose_item("server", [ip for ip, _ in servers], is_valid_host,
+                                     "a Remote Server IP (e.g. 192.168.1.50)")
+                remote = list_remote_devices(srv_ip, numbered=True)
+                rem_bus = choose_item("device", [extract_busid(r) for r in remote], is_valid_busid,
+                                      "a Remote Bus ID to attach (e.g. 1-1)")
+                connect_remote_device(srv_ip, rem_bus)
+                pause()
+            elif choice == "0":
+                if list_client_ports():
+                    port_or_bus = ask("Enter Port number, Bus ID, or 'all' to detach (q to cancel): ")
+                    if not port_or_bus:
+                        raise PromptCancelled()
+                    disconnect_remote_device(port_or_bus)
+                pause()
+        except PromptCancelled:
+            continue
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}Cancelled.{RESET}")
+            pause()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LINUX CLIENT MODE (vhci_hcd + On-Demand Dynamic BIND/UNBIND TCP 3241)
@@ -981,7 +1231,12 @@ def render_dashboard():
 
 def is_valid_host(host):
     """Validate hostname or IPv4 address strictly against command injection."""
-    return bool(host and isinstance(host, str) and re.match(r"^[a-zA-Z0-9.\-_]+$", host.strip()))
+    return bool(host and isinstance(host, str) and re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9.\-_]*$", host.strip()))
+
+def extract_busid(line):
+    """Return the Bus ID at the start of a device listing line ('  1-1.2    : ...'), or None."""
+    m = re.match(r"^\s*(\d+-[\d.]+)\s*:", line or "")
+    return m.group(1) if m else None
 
 def send_control_command(server_ip, cmd_line, port=CONTROL_PORT, timeout=2.5):
     """Send a single-line control command to remote TCP 3241 daemon and parse JSON response."""
@@ -997,7 +1252,7 @@ def send_control_command(server_ip, cmd_line, port=CONTROL_PORT, timeout=2.5):
         pass
     return None
 
-def scan_network_servers(port=CONTROL_PORT, timeout=1.2):
+def scan_network_servers(port=CONTROL_PORT, timeout=1.2, numbered=False):
     """Broadcast UDP discovery probe on port 3241 to find USB/IP servers on LAN."""
     print(f"\n{CYAN}═══ 🔍 Scanning LAN for USB/IP Servers (UDP {port}) ═══{RESET}")
     found = []
@@ -1037,13 +1292,14 @@ def scan_network_servers(port=CONTROL_PORT, timeout=1.2):
         print(f"{YELLOW}Discovery warning: {e}{RESET}")
 
     if found:
-        for ip, host in found:
-            print(f"  {GREEN}●{RESET} {BOLD}{ip}{RESET} ({host})")
+        for idx, (ip, host) in enumerate(found, start=1):
+            prefix = f"{BOLD}[{idx}]{RESET} " if numbered else ""
+            print(f"  {prefix}{GREEN}●{RESET} {BOLD}{ip}{RESET} ({host})")
     else:
         print(f"  {DIM}No broadcast responders replied within {timeout:.1f}s (you can still connect by direct IP).{RESET}")
     return found
 
-def list_remote_devices(server_ip):
+def list_remote_devices(server_ip, numbered=False):
     """List remote USB devices on server_ip using both TCP 3241 dynamic inventory and TCP 3240."""
     if not is_valid_host(server_ip):
         print(f"{RED}[Error] Invalid server IP or hostname: {server_ip}{RESET}")
@@ -1070,14 +1326,14 @@ def list_remote_devices(server_ip):
     if not results:
         bin_path = shutil.which("usbip")
         if bin_path:
-            out = run_cmd([bin_path, "list", "-r", ip])
+            out = run_cmd([bin_path, "list", "-r", ip], timeout=10)
             for line in out.splitlines():
                 if re.search(r"^\s*\d+-[\d.]+\s*:", line):
                     results.append("  " + line.strip())
 
     if results:
-        for r in results:
-            print(r)
+        for idx, r in enumerate(results, start=1):
+            print(f"  {BOLD}[{idx}]{RESET} {r.strip()}" if numbered else r)
     else:
         print(f"  {YELLOW}No remote USB devices found on {ip} (verify server IP and ports 3240/3241).{RESET}")
     return results
@@ -1090,16 +1346,18 @@ def connect_remote_device(server_ip, busid):
     if not is_valid_host(server_ip) or not is_valid_busid(busid):
         print(f"{RED}[Error] Invalid Server IP ({server_ip}) or Bus ID ({busid}).{RESET}")
         return False
-    if not is_root():
-        print(f"{YELLOW}[!] Superuser privileges required for vhci_hcd attach. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
-
     ip = server_ip.strip()
     bid = busid.strip()
 
+    if not is_root():
+        print(f"{YELLOW}[!] Superuser privileges required for vhci_hcd attach. Re-running with sudo...{RESET}")
+        return rerun_with_sudo("connect", ip, bid)
+
     # 1. Load Linux USB/IP client kernel modules
     run_cmd(["modprobe", "usbip_core"])
-    run_cmd(["modprobe", "vhci_hcd"])
+    rc, _, err = run_cmd_result(["modprobe", "vhci_hcd"])
+    if rc != 0:
+        print(f"{YELLOW}[!] Could not load vhci_hcd kernel module: {err or f'exit code {rc}'}{RESET}")
 
     # 2. Request on-demand BIND via TCP 3241 if server supports Dynamic Control
     bind_resp = send_control_command(ip, f"BIND {bid}")
@@ -1111,6 +1369,8 @@ def connect_remote_device(server_ip, busid):
         elif st == "OK":
             print(f"{GREEN}✓ On-demand BIND {bid} accepted by {ip}:{CONTROL_PORT}{RESET}")
             time.sleep(0.25)
+        elif bind_resp.get("message"):
+            print(f"{YELLOW}[!] Remote BIND {bid} reported: {bind_resp.get('message')}{RESET}")
 
     # 3. Attach into local vhci_hcd
     bin_path = shutil.which("usbip")
@@ -1118,9 +1378,11 @@ def connect_remote_device(server_ip, busid):
         print(f"{RED}[Error] 'usbip' client binary not found. Install linux-tools-generic or usbip.{RESET}")
         return False
 
-    out = run_cmd([bin_path, "attach", "-r", ip, "-b", bid])
-    if "error" in out.lower() or "failed" in out.lower():
-        print(f"{RED}✗ Failed to attach {bid} from {ip}: {out}{RESET}")
+    # usbip reports errors on stderr, so check the exit code and both streams
+    rc, out, err = run_cmd_result([bin_path, "attach", "-r", ip, "-b", bid])
+    combined = f"{out}\n{err}".strip()
+    if rc != 0 or "error" in combined.lower() or "failed" in combined.lower():
+        print(f"{RED}✗ Failed to attach {bid} from {ip}: {combined or f'exit code {rc}'}{RESET}")
         return False
 
     print(f"{GREEN}✓ Attached {bid} from {ip} into local Linux vhci_hcd!{RESET}")
@@ -1176,7 +1438,7 @@ def disconnect_remote_device(target="all"):
         return False
     if not is_root():
         print(f"{YELLOW}[!] Superuser privileges required for vhci_hcd detach. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
+        return rerun_with_sudo("disconnect", (target or "all").strip())
 
     bin_path = shutil.which("usbip")
     if not bin_path:
@@ -1189,21 +1451,30 @@ def disconnect_remote_device(target="all"):
         return True
 
     tgt = (target or "all").strip().lower()
+    tgt_port = str(int(tgt)) if tgt.isdigit() else tgt
     matched = [
         e for e in entries
-        if tgt == "all" or e["port"] == tgt.lstrip("0") or e["port"] == tgt or e["busid"].lower() == tgt
+        if tgt == "all" or e["port"] == tgt_port or e["busid"].lower() == tgt
     ]
     if not matched and tgt.isdigit():
-        matched = [{"port": tgt, "ip": "", "busid": "", "desc": ""}]
+        matched = [{"port": tgt_port, "ip": "", "busid": "", "desc": ""}]
+    if not matched:
+        print(f"{YELLOW}No attached port or Bus ID matches '{target}'.{RESET}")
+        return False
 
+    all_ok = True
     for e in matched:
-        run_cmd([bin_path, "detach", "-p", e["port"]])
+        rc, out, err = run_cmd_result([bin_path, "detach", "-p", e["port"]])
+        if rc != 0:
+            print(f"{RED}✗ Failed to detach Port {e['port']}: {err or out or f'exit code {rc}'}{RESET}")
+            all_ok = False
+            continue
         print(f"{GREEN}✓ Detached local vhci_hcd Port {e['port']}{RESET}")
         if e["ip"] and e["busid"]:
             unbind_resp = send_control_command(e["ip"], f"UNBIND {e['busid']}")
             if isinstance(unbind_resp, dict) and (unbind_resp.get("status") or "").upper() == "OK":
                 print(f"{GREEN}✓ Released {e['busid']} back to remote host {e['ip']}{RESET}")
-    return True
+    return all_ok
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCHER
@@ -1216,7 +1487,7 @@ def apply_dualsense_fix():
         return False
     if not is_root():
         print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
-        return subprocess.run(["sudo", sys.executable, *sys.argv], timeout=30).returncode == 0
+        return rerun_with_sudo("fix-dualsense")
 
     rule_path = "/etc/udev/rules.d/99-snakeusbip-dualsense-fix.rules"
     rule_content = (
@@ -1263,7 +1534,7 @@ def main():
                         choices=["dashboard", "status", "start", "stop", "restart",
                                  "list", "share", "unshare", "policy", "auto-unbind",
                                  "dynamic-daemon", "fix-dualsense", "doctor", "test", "logs",
-                                 "scan", "remote", "connect", "attach", "disconnect", "detach", "ports"],
+                                 "scan", "remote", "connect", "attach", "disconnect", "detach", "ports", "mode"],
                         help="Action to perform (default: interactive dashboard)")
     parser.add_argument("busid", nargs="?", default=None, help="Target USB bus ID or action parameter")
     parser.add_argument("extra", nargs="?", default=None, help="Additional argument for policy management")
@@ -1272,7 +1543,19 @@ def main():
     args = parser.parse_args()
 
     if args.command == "dashboard":
-        render_dashboard()
+        role = load_role()
+        if not role:
+            role = ask_role()
+            save_role(role)
+        offer_sudo_relaunch(role)
+        render_dashboard(role)
+    elif args.command == "mode":
+        if args.busid:
+            if args.busid not in ROLES:
+                print(f"{RED}Error: mode must be one of: {', '.join(ROLES)}{RESET}")
+                sys.exit(1)
+            sys.exit(0 if save_role(args.busid) else 1)
+        print(load_role() or "not set")
     elif args.command == "status":
         st = get_service_status()
         st["lan_ip"] = get_lan_ip()
@@ -1286,13 +1569,16 @@ def main():
             print(f"LAN IP:            {st['lan_ip']}")
             print(f"Devices detected:  {len(st['devices'])}")
     elif args.command == "start":
-        start_service()
+        sys.exit(0 if start_service() else 1)
     elif args.command == "stop":
-        stop_service()
+        sys.exit(0 if stop_service() else 1)
     elif args.command == "restart":
+        if not is_root():
+            print(f"{YELLOW}[!] Superuser privileges required. Re-running with sudo...{RESET}")
+            sys.exit(0 if rerun_with_sudo("restart") else 1)
         stop_service()
         time.sleep(1)
-        start_service()
+        sys.exit(0 if start_service() else 1)
     elif args.command == "list":
         devs = list_devices()
         print(f"Discovered USB Peripherals ({len(devs)}):")
@@ -1302,12 +1588,12 @@ def main():
         if not args.busid:
             print(f"{RED}Error: Missing bus ID. Usage: snakeusbip-ctl share <busid>{RESET}")
             sys.exit(1)
-        share_device(args.busid)
+        sys.exit(0 if share_device(args.busid) else 1)
     elif args.command == "unshare":
         if not args.busid:
             print(f"{RED}Error: Missing bus ID. Usage: snakeusbip-ctl unshare <busid>{RESET}")
             sys.exit(1)
-        unshare_device(args.busid)
+        sys.exit(0 if unshare_device(args.busid) else 1)
     elif args.command == "policy":
         pol = load_policy()
         action = (args.busid or "").lower()
@@ -1392,4 +1678,8 @@ def main():
         list_client_ports()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Interrupted.{RESET}")
+        sys.exit(130)
